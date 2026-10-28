@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Silenzium</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='6' fill='%2314b8a6'/><path d='M5 16h4l2-7 3 14 3-10 2 3h8' stroke='white' stroke-width='2.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>">
+  <link rel="stylesheet" href="css/style.css">
+  <script type="module" src="js/main.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <h1>Silenzium</h1>
+      <span class="tagline">Stille entfernen &amp; exakt wieder einfügen</span>
+    </div>
+    <div class="actions">
+      <button id="btn-new" type="button">Neu</button>
+      <button id="btn-open-project" type="button">Projekt öffnen</button>
+      <button id="btn-save-project" type="button" class="primary">Projekt speichern</button>
+      <label class="check" title="Die Eingabedatei wird Base64-kodiert in die Projektdatei geschrieben">
+        <input type="checkbox" id="opt-embed" checked> Eingabedatei einbetten
+      </label>
+      <input type="file" id="project-file" accept=".json,application/json" hidden>
+    </div>
+  </header>
+
+  <main>
+    <!-- 1 · Eingabe -->
+    <section class="card" id="sec-input">
+      <h2><span class="step">1</span> Eingabedatei</h2>
+      <div class="dropzone" id="drop-input" tabindex="0">
+        <p>WAV- oder MP3-Datei hierher ziehen oder <button type="button" class="link" data-pick="input-file">auswählen</button></p>
+        <p class="hint">Eine Projektdatei (.json) kann ebenfalls hier abgelegt werden.</p>
+        <input type="file" id="input-file" accept=".wav,.mp3,audio/wav,audio/x-wav,audio/mpeg" hidden>
+      </div>
+      <dl class="info" id="input-info"></dl>
+      <p class="notice" id="input-notice" hidden></p>
+    </section>
+
+    <!-- 2 · Analyse & Reduktion -->
+    <section class="card" id="sec-detect">
+      <h2><span class="step">2</span> Stille erkennen &amp; entfernen</h2>
+
+      <div class="params">
+        <label class="param wide">
+          <span>Threshold <small>(dBFS, RMS)</small></span>
+          <div class="row">
+            <input type="range" min="-90" max="0" step="0.5" data-param="thresholdDb" data-sync="threshold">
+            <input type="number" min="-120" max="0" step="0.5" data-param="thresholdDb" data-sync="threshold">
+            <button type="button" id="btn-estimate" title="Schätzt das Grundrauschen und setzt den Threshold knapp darüber">Grundrauschen schätzen</button>
+          </div>
+          <small class="hint" id="noise-hint">Alles unterhalb dieses Pegels gilt als Stille – inkl. Grundrauschen.</small>
+        </label>
+        <label class="param"><span>Pre <small>(ms)</small></span>
+          <input type="number" min="0" step="10" data-param="preMs"></label>
+        <label class="param"><span>Post <small>(ms)</small></span>
+          <input type="number" min="0" step="10" data-param="postMs"></label>
+        <label class="param"><span>Min. Stille <small>(ms)</small></span>
+          <input type="number" min="0" step="10" data-param="minSilenceMs"></label>
+        <label class="param"><span>Min. Geräusch <small>(ms)</small></span>
+          <input type="number" min="0" step="5" data-param="minSoundMs"></label>
+        <label class="param"><span>Analysefenster <small>(ms)</small></span>
+          <input type="number" min="1" max="200" step="1" data-param="windowMs"></label>
+        <label class="param"><span>Blende an Schnitten <small>(ms)</small></span>
+          <input type="number" min="0" max="50" step="1" data-param="fadeMs"></label>
+        <label class="param"><span>WAV-Exportformat</span>
+          <select data-param="exportFormat">
+            <option value="auto">wie Eingabe</option>
+            <option value="pcm16">16 Bit PCM</option>
+            <option value="pcm24">24 Bit PCM</option>
+            <option value="float32">32 Bit Float</option>
+          </select></label>
+      </div>
+
+      <div class="overview-wrap">
+        <canvas id="overview" class="overview"></canvas>
+        <div class="legend">
+          <span><i class="sw wave"></i>Pegel (RMS)</span>
+          <span><i class="sw silence"></i>Stille (wird entfernt)</span>
+          <span><i class="sw keep"></i>behaltene Passagen inkl. Pre/Post</span>
+          <span><i class="sw threshold"></i>Threshold</span>
+        </div>
+      </div>
+
+      <div class="stats" id="stats"></div>
+
+      <details id="timecodes">
+        <summary>Timecodes</summary>
+        <div class="table-wrap"><table id="segment-table"></table></div>
+      </details>
+
+      <div class="toolbar">
+        <button type="button" id="btn-play-original">▶ Original</button>
+        <button type="button" id="btn-play-reduced">▶ Reduziert</button>
+        <button type="button" id="btn-stop" class="stop">■ Stopp</button>
+        <span class="spacer"></span>
+        <button type="button" id="btn-export-reduced" class="primary">Reduzierte WAV exportieren</button>
+      </div>
+    </section>
+
+    <!-- 3 · Wiederherstellung -->
+    <section class="card" id="sec-restore">
+      <h2><span class="step">3</span> Stille wieder einfügen</h2>
+      <p class="hint">Öffne die bearbeitete Version der reduzierten Datei (z. B. nach Voice-Changer). Sie wird an den gespeicherten
+        Schnittpunkten zerteilt und mit Stille auf exakt die Länge des Originals aufgefüllt.</p>
+      <div class="dropzone" id="drop-processed" tabindex="0">
+        <p>Bearbeitete WAV/MP3 hierher ziehen oder <button type="button" class="link" data-pick="processed-file">auswählen</button></p>
+        <input type="file" id="processed-file" accept=".wav,.mp3,audio/wav,audio/x-wav,audio/mpeg" hidden>
+      </div>
+      <dl class="info" id="processed-info"></dl>
+
+      <div class="params">
+        <label class="param"><span>Zuordnung</span>
+          <select data-param="restoreMode"
+            title="exakt: Segmente an den gespeicherten Sample-Positionen · proportional: Längenabweichung gleichmäßig über alle Schnitte verteilen">
+            <option value="exact">exakt</option>
+            <option value="stretch">proportional</option>
+          </select></label>
+        <label class="param"><span>Versatz <small>(ms)</small></span>
+          <input type="number" step="1" data-param="restoreOffsetMs"
+            title="Positiv: die ersten x ms der bearbeiteten Datei werden übersprungen (z. B. Codec-Verzögerung)"></label>
+      </div>
+
+      <div class="toolbar">
+        <button type="button" id="btn-play-restored">▶ Wiederhergestellt</button>
+        <button type="button" class="stop" data-action="stop">■ Stopp</button>
+        <span class="spacer"></span>
+        <button type="button" id="btn-export-restored" class="primary">Wiederhergestellte WAV exportieren</button>
+      </div>
+      <p class="notice ok" id="restore-result" hidden></p>
+    </section>
+  </main>
+
+  <div class="busy" id="busy" hidden><div class="spinner"></div><span id="busy-text"></span></div>
+  <div class="toasts" id="toasts"></div>
+</body>
+</html>
