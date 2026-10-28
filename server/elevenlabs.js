@@ -65,57 +65,78 @@ async function listVoices(voiceType) {
 
 const byName = (a, b) => a.name.localeCompare(b.name, 'de');
 
-async function handleVoices(req, res) {
+// ---------------------------------------------------------------- Funktionen (auch für das CLI)
+
+export const isConfigured = () => !!apiKey();
+
+/** Eigene (personal) und gespeicherte Voices, ohne Doppelungen, nach Name sortiert. */
+export async function getVoices() {
   const [personal, saved] = await Promise.all([listVoices('personal'), listVoices('saved')]);
   const own = new Set(personal.map((v) => v.voice_id));
-  sendJson(res, 200, {
+  return {
     personal: personal.sort(byName),
     saved: saved.filter((v) => !own.has(v.voice_id)).sort(byName),
-  });
+  };
 }
 
-async function handleModels(req, res) {
+/** Modelle mit Voice-Changer-Unterstützung. */
+export async function getModels() {
   const models = await (await callApi('/v1/models')).json();
-  sendJson(res, 200, models
+  return models
     .filter((m) => m.can_do_voice_conversion)
-    .map((m) => ({ model_id: m.model_id, name: m.name, description: m.description ?? '' })));
+    .map((m) => ({ model_id: m.model_id, name: m.name, description: m.description ?? '' }));
 }
 
-async function handleVoiceChanger(req, res, url, [voiceId]) {
-  const query = url.searchParams;
-  const outputFormat = query.get('output_format') || 'mp3_44100_128';
+/**
+ * Voice Changer: rohes pcm_s16le_16 (16 kHz, Mono) → Audio im gewünschten Format.
+ * @returns {Promise<{ body: Buffer, contentType: string }>}
+ */
+export async function voiceChange(audio, { voiceId, modelId, outputFormat = 'mp3_44100_128', removeBackgroundNoise, seed }, signal) {
   if (!/^[a-z][a-z0-9]*_\d+(_\d+)?$/.test(outputFormat)) throw new HttpError(400, 'Ungültiges output_format.');
-
-  const audio = await readBody(req, MAX_UPLOAD_BYTES);
-  if (!audio.length) throw new HttpError(400, 'Keine Audiodaten erhalten.');
+  if (!voiceId || !/^[\w-]+$/.test(voiceId)) throw new HttpError(400, 'Ungültige voice_id.');
+  if (!audio?.length) throw new HttpError(400, 'Keine Audiodaten erhalten.');
 
   const form = new FormData();
   form.append('audio', new Blob([audio], { type: 'application/octet-stream' }), 'audio.pcm');
   form.append('file_format', 'pcm_s16le_16');
-  if (query.get('model_id')) form.append('model_id', query.get('model_id'));
-  if (query.get('remove_background_noise') === 'true') form.append('remove_background_noise', 'true');
-  if (query.get('seed')) form.append('seed', query.get('seed'));
+  if (modelId) form.append('model_id', modelId);
+  if (removeBackgroundNoise) form.append('remove_background_noise', 'true');
+  if (seed != null && seed !== '') form.append('seed', String(seed));
+
+  const upstream = await callApi(
+    `/v1/voice-changer/${encodeURIComponent(voiceId)}?${new URLSearchParams({ output_format: outputFormat })}`,
+    { method: 'POST', body: form, signal },
+  );
+  return {
+    body: Buffer.from(await upstream.arrayBuffer()),
+    contentType: upstream.headers.get('content-type') ?? 'application/octet-stream',
+  };
+}
+
+// ---------------------------------------------------------------- HTTP-Routen
+
+async function handleVoiceChanger(req, res, url, [voiceId]) {
+  const query = url.searchParams;
+  const audio = await readBody(req, MAX_UPLOAD_BYTES);
 
   // Bricht der Browser ab, wird auch die Anfrage an ElevenLabs abgebrochen
   const abort = new AbortController();
   res.on('close', () => { if (!res.writableFinished) abort.abort(); });
 
-  const upstream = await callApi(
-    `/v1/voice-changer/${encodeURIComponent(voiceId)}?${new URLSearchParams({ output_format: outputFormat })}`,
-    { method: 'POST', body: form, signal: abort.signal },
-  );
-  const body = Buffer.from(await upstream.arrayBuffer());
-  res.writeHead(200, {
-    'Content-Type': upstream.headers.get('content-type') ?? 'application/octet-stream',
-    'Content-Length': body.length,
-    'Cache-Control': 'no-store',
-  });
+  const { body, contentType } = await voiceChange(audio, {
+    voiceId,
+    modelId: query.get('model_id'),
+    outputFormat: query.get('output_format') || undefined,
+    removeBackgroundNoise: query.get('remove_background_noise') === 'true',
+    seed: query.get('seed'),
+  }, abort.signal);
+  res.writeHead(200, { 'Content-Type': contentType, 'Content-Length': body.length, 'Cache-Control': 'no-store' });
   res.end(body);
 }
 
 export const elevenLabsRoutes = [
-  { method: 'GET', pattern: /^\/api\/elevenlabs\/status$/, handler: (req, res) => sendJson(res, 200, { configured: !!apiKey() }) },
-  { method: 'GET', pattern: /^\/api\/elevenlabs\/voices$/, handler: handleVoices },
-  { method: 'GET', pattern: /^\/api\/elevenlabs\/models$/, handler: handleModels },
+  { method: 'GET', pattern: /^\/api\/elevenlabs\/status$/, handler: (req, res) => sendJson(res, 200, { configured: isConfigured() }) },
+  { method: 'GET', pattern: /^\/api\/elevenlabs\/voices$/, handler: async (req, res) => sendJson(res, 200, await getVoices()) },
+  { method: 'GET', pattern: /^\/api\/elevenlabs\/models$/, handler: async (req, res) => sendJson(res, 200, await getModels()) },
   { method: 'POST', pattern: /^\/api\/elevenlabs\/voice-changer\/([\w-]+)$/, handler: handleVoiceChanger },
 ];

@@ -33,6 +33,7 @@ export const DEFAULT_PARAMS = Object.freeze({
   elPerChannel: false,  // Kanäle einzeln konvertieren (echtes Stereo, Credits × Kanalzahl)
   elSeed: null,         // null = zufällig
   elChunkSec: 240,      // API-Limit: 5 min pro Anfrage
+  elAutoAlign: true,    // zeitlichen Versatz der Antwort (z. B. MP3-Verzögerung) erkennen und ausgleichen
 });
 
 /** Parameter, deren Änderung eine neue Analyse auslöst. */

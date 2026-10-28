@@ -126,6 +126,9 @@
           <label class="param"><span>Seed <small>(optional)</small></span>
             <input type="number" min="0" max="4294967295" step="1" data-param="elSeed" data-optional placeholder="zufällig"></label>
           <label class="param check-param"><input type="checkbox" data-param="elRemoveNoise"> Hintergrundgeräusche entfernen</label>
+          <label class="param check-param"
+            title="Vergleicht den Pegelverlauf von gesendetem und empfangenem Audio und gleicht eine zeitliche Verschiebung (z. B. MP3-Verzögerung) aus">
+            <input type="checkbox" data-param="elAutoAlign"> Versatz automatisch ausgleichen</label>
           <label class="param check-param span2"
             title="Jeder Kanal wird separat an die API gesendet (Credits × Kanalzahl). Alle Kanäle nutzen denselben Seed.">
             <input type="checkbox" id="el-per-channel" data-param="elPerChannel"> Kanäle einzeln konvertieren

@@ -4,9 +4,14 @@
  * Antwort dekodieren → auf Original-Samplerate → auf erwartete Chunk-Länge anpassen → zusammensetzen.
  *
  * Durch die Längenanpassung je Chunk kann sich keine Abweichung über die Datei aufsummieren;
- * das Ergebnis hat exakt die Länge der reduzierten Datei.
+ * das Ergebnis hat exakt die Länge der reduzierten Datei. Optional wird vorher ein zeitlicher Versatz
+ * (z. B. MP3-Encoder-Verzögerung) erkannt und ausgeglichen.
+ *
+ * Audio-Funktionen sind austauschbar (deps): im Browser Web Audio und der lokale Proxy,
+ * in Node (CLI) ein JS-Resampler, ein WASM-MP3-Decoder und der direkte API-Aufruf.
  */
 import { planChunks, fitLength } from '../core/chunks.js';
+import { estimateLag, shiftSignal } from '../core/align.js';
 import { encodePcmS16le, decodePcmS16le } from '../audio/wav.js';
 import { decodeAudio } from '../audio/decode.js';
 import { resample, mixToMono } from '../audio/resample.js';
@@ -21,8 +26,8 @@ export const OUTPUT_FORMATS = [
   { value: 'wav_44100', label: 'WAV 44,1 kHz (ab Pro)' },
   { value: 'wav_48000', label: 'WAV 48 kHz (ab Pro)' },
   { value: 'pcm_44100', label: 'PCM 44,1 kHz (ab Pro)' },
-  { value: 'pcm_24000', label: 'PCM 24 kHz' },
-  { value: 'wav_24000', label: 'WAV 24 kHz' },
+  { value: 'pcm_24000', label: 'PCM 24 kHz (alle Tarife)' },
+  { value: 'wav_24000', label: 'WAV 24 kHz (alle Tarife)' },
 ];
 
 /** Antwort der API in Kanäle dekodieren. pcm_* ist rohes s16le Mono. */
@@ -43,11 +48,16 @@ export async function decodeApiAudio(buffer, outputFormat) {
  *   options              – { voiceId, modelId, outputFormat, removeBackgroundNoise, seed }
  *   maxChunkSec          – maximale Länge je Anfrage
  *   perChannel           – Kanäle einzeln konvertieren
+ *   autoAlign            – zeitlichen Versatz je Chunk erkennen und ausgleichen
  *   onProgress(event)    – { type: 'start'|'chunk-start'|'chunk-done', ... }
  *   signal               – AbortSignal
+ *   deps                 – { resample(channels, from, to), decode(buffer, outputFormat), convert(pcm, options, signal) }
  * @returns {Promise<{ channels: Float32Array[], apiSampleRate: number, apiChannels: number, report: object[] }>}
  */
-export async function runVoiceChanger({ channels, sampleRate, layout, options, maxChunkSec, perChannel = false, onProgress, signal }) {
+export async function runVoiceChanger({
+  channels, sampleRate, layout, options, maxChunkSec, perChannel = false, autoAlign = false, onProgress, signal,
+  deps = { resample, decode: decodeApiAudio, convert: convertVoice },
+}) {
   const chunks = planChunks(layout, Math.round(maxChunkSec * sampleRate));
   const groups = perChannel && channels.length > 1 ? channels.map((c) => [c]) : [channels];
   const outs = groups.map(() => new Float32Array(layout.reducedLength));
@@ -66,16 +76,29 @@ export async function runVoiceChanger({ channels, sampleRate, layout, options, m
       onProgress?.({ type: 'chunk-start', ...info });
 
       const part = mixToMono(group.map((c) => c.subarray(chunk.start, chunk.end)));
-      const [mono16k] = await resample(part, sampleRate, API_INPUT_RATE);
-      const response = await convertVoice(encodePcmS16le(mono16k), options, signal);
+      const [mono16k] = await deps.resample(part, sampleRate, API_INPUT_RATE);
+      const response = await deps.convert(encodePcmS16le(mono16k), options, signal);
 
-      const decoded = await decodeApiAudio(response, options.outputFormat);
+      const decoded = await deps.decode(response, options.outputFormat);
       apiSampleRate = decoded.sampleRate;
       apiChannels = decoded.channels.length;
-      const [atSourceRate] = await resample(mixToMono(decoded.channels), decoded.sampleRate, sampleRate);
+      let [atSourceRate] = await deps.resample(mixToMono(decoded.channels), decoded.sampleRate, sampleRate);
+      const received = atSourceRate.length;
+
+      let lagSamples = null;
+      if (autoAlign) {
+        const lag = estimateLag(part[0], atSourceRate, sampleRate);
+        if (lag && Math.abs(lag.lagSamples) < sampleRate * 0.0005) lag.lagSamples = 0; // unter 0,5 ms: Messrauschen
+        if (lag && lag.lagSamples !== 0) {
+          lagSamples = lag.lagSamples;
+          atSourceRate = shiftSignal(atSourceRate, lagSamples);
+        } else if (lag) {
+          lagSamples = 0;
+        }
+      }
       outs[g].set(fitLength(atSourceRate, expected), chunk.start);
 
-      const entry = { ...info, received: atSourceRate.length, bytes: response.byteLength, apiSampleRate, apiChannels };
+      const entry = { ...info, received, bytes: response.byteLength, apiSampleRate, apiChannels, lagSamples };
       report.push(entry);
       onProgress?.({ type: 'chunk-done', ...entry });
       step++;

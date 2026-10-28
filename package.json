@@ -1,15 +1,23 @@
-﻿{
+{
   "name": "silenzium",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Stille in Audiodateien entfernen und später sample-genau wieder einfügen.",
   "private": true,
   "type": "module",
   "engines": {
     "node": ">=18"
   },
+  "bin": {
+    "silenzium": "cli/silenzium.js"
+  },
   "scripts": {
     "start": "node server.js --open",
     "serve": "node server.js",
+    "cli": "node cli/silenzium.js",
+    "vegas:install": "node cli/install-vegas.js",
     "test": "node --test"
+  },
+  "dependencies": {
+    "mpg123-decoder": "1.0.3"
   }
 }

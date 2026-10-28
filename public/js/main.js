@@ -2,11 +2,14 @@ import { DEFAULT_PARAMS, DETECTION_KEYS, msToSamples } from './core/params.js';
 import { computeEnvelope, detectSegments, suggestThreshold } from './core/detect.js';
 import { layoutSegments, renderReduced, renderRestored } from './core/segments.js';
 import { buildProject, parseProject } from './core/project.js';
-import { analyzePan, upmixPanned, describePan } from './core/pan.js';
-import { analyzeLevel, matchLevel, globalGain, toDb } from './core/level.js';
+import { describePan } from './core/pan.js';
+import { globalGain, toDb } from './core/level.js';
+import {
+  analyzeOriginal, outputChannelCount as outputChannelCountFor, usesPan as usesPanFor, toOutputChannels, processedOutputChannels,
+} from './core/output.js';
 import { decodeAudio } from './audio/decode.js';
 import { encodeWav, resolveSampleFormat, SAMPLE_FORMATS } from './audio/wav.js';
-import { resample, matchChannels } from './audio/resample.js';
+import { resample } from './audio/resample.js';
 import * as player from './audio/player.js';
 import { sha256Hex, bytesToDataUrl, dataUrlToBytes, guessMimeType, saveFile } from './util/files.js';
 import { formatTime, formatBytes, baseName } from './util/format.js';
@@ -185,44 +188,18 @@ function reducedChannels() {
   return renderReduced(sourceAudio.channels, layout, sourceAudio.sampleRate, params.fadeMs);
 }
 
-/** Kanalzahl aller Exporte: wie die Eingabe, oder 1 bei „Mono-Ausgabe“. */
-function outputChannelCount() {
-  const { params, source } = store.state;
-  return params.monoOutput ? 1 : source.channelCount;
-}
+/** Kontext für die gemeinsame Ausgabe-Logik (core/output.js). */
+const outputCtx = () => ({ layout: store.state.layout, params: store.state.params, sourceChannelCount: store.state.source.channelCount });
+
+const outputChannelCount = () => outputChannelCountFor(outputCtx());
+const usesPan = (channels) => usesPanFor(channels, outputCtx());
+const toOutput = (channels, timeline = 'dst') => toOutputChannels(channels, outputCtx(), timeline);
+const processedOutput = (channels, timeline = 'dst') => processedOutputChannels(channels, outputCtx(), timeline);
 
 const formatDb = (rms) => (rms ? `${toDb(rms).toFixed(1).replace('-', '−')} dBFS` : '–');
 
 function channelLabel(count) {
   return count === 1 ? 'Mono' : count === 2 ? 'Stereo' : `${count} Kanäle`;
-}
-
-/** Mono-Ergebnis → Stereo-Ausgabe mit dem erkannten Panning des Originals? */
-function usesPan(channels) {
-  const { layout, params } = store.state;
-  return channels.length === 1 && outputChannelCount() === 2 && params.panMode !== 'off' && !!layout?.panGlobal;
-}
-
-/**
- * Bringt Kanäle auf die Ausgabe-Kanalzahl. Ein Mono-Signal wird dabei – falls erkannt – mit dem
- * Panning des Originals verteilt, sonst gleich auf alle Kanäle.
- * @param {'dst'|'src'} timeline Zeitachse der Kanäle: reduzierte Datei oder Original
- */
-function toOutput(channels, timeline = 'dst') {
-  const { layout, params } = store.state;
-  if (usesPan(channels)) return upmixPanned(channels[0], layout, { mode: params.panMode, timeline });
-  return matchChannels(channels, outputChannelCount());
-}
-
-/** Wie toOutput, für bearbeitete Ergebnisse zusätzlich mit Pegelabgleich an das Original. */
-function processedOutput(channels, timeline = 'dst') {
-  const { layout, params } = store.state;
-  return matchLevel(toOutput(channels, timeline), layout, { mode: params.levelMode, timeline });
-}
-
-/** Ermittelt Panning und Pegel des Originals (für die Nachbildung in bearbeiteten Ergebnissen). */
-function analyzeOriginal(channels, layout) {
-  return analyzeLevel(channels, analyzePan(channels, layout));
 }
 
 /**

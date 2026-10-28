@@ -8,14 +8,15 @@ Das Ergebnis hat exakt dieselbe Länge (in Samples) wie die Ausgangsdatei.
 
 ## Starten
 
-Voraussetzung: [Node.js](https://nodejs.org) ab Version 18. Es werden **keine** npm-Pakete benötigt.
+Voraussetzung: [Node.js](https://nodejs.org) ab Version 18.
 
 ```bash
 cd silenzium
+npm install        # einmalig (MP3-Decoder für Kommandozeile/Vegas-Skript)
 npm start          # startet den Server und öffnet den Browser
 ```
 
-Unter Windows genügt ein Doppelklick auf `start.bat`.
+Unter Windows genügt ein Doppelklick auf `start.bat` (installiert beim ersten Start automatisch).
 
 Die App läuft dann unter <http://127.0.0.1:5173/>. Anderer Port: `PORT=8080 npm start`
 (PowerShell: `$env:PORT=8080; npm start`). Empfohlen wird ein Chromium-Browser (Chrome/Edge),
@@ -147,18 +148,94 @@ deinen lokalen Server Credits verbrauchen können. Ohne Key ist das Panel einfac
 - Das Ergebnis wird automatisch in Schritt 3 übernommen und kann zusätzlich mit **Konvertierte WAV exportieren** gespeichert werden.
 - Die angezeigten Credits sind eine Schätzung (1.000 je Minute Audio).
 
+- **Versatz automatisch ausgleichen** (Standard an): Je Teil wird der Pegelverlauf von gesendetem und empfangenem
+  Audio verglichen und eine zeitliche Verschiebung ausgeglichen – typisch ist die MP3-Encoder-Verzögerung von
+  ca. 25 ms. Das Protokoll zeigt den erkannten Versatz.
+
 Die ElevenLabs-Einstellungen (Voice, Modell, Format, …) werden mit im Projekt gespeichert.
+
+**Ausgabeformat im Free-Tarif:** WAV/PCM mit 44,1 kHz erfordern laut ElevenLabs den Pro-Tarif. Im Free-Tarif
+gibt es `mp3_44100_128` (Standard) oder verlustfrei `pcm_24000`/`wav_24000` (geringere Bandbreite).
+
+## Vegas Pro: Stimmen per Skript umwandeln
+
+Für Projekte mit einer Audiospur pro Charakter (z. B. „Anna“) erledigt ein Vegas-Skript den ganzen Ablauf:
+
+1. Gewählte Spuren einzeln **solo rendern** – nur die **Zeitauswahl** (Loop-Region) oder das ganze Projekt
+2. Silenzium verarbeitet jede Spur: Stille entfernen → ElevenLabs → Stille, Panning und Pegel wiederherstellen
+3. Ergebnis als **neues Event** auf der Spur „Anna_VC“ an exakt derselben Position einfügen
+   (die Spur wird bei Bedarf direkt unter dem Original angelegt)
+
+Weil das Ergebnis immer exakt die Länge des gerenderten Bereichs hat, sitzt es sample-genau.
+
+**Installation** (einmalig, Vegas Pro 14 oder neuer):
+
+```bash
+npm install
+npm run vegas:install
+```
+
+Das kopiert das Skript nach `Dokumente\Vegas Script Menu` und trägt den Silenzium-Ordner und Node.js in
+`%APPDATA%\Silenzium\vegas.ini` ein. In Vegas danach im Menü *Extras → Skripterstellung*
+(engl. *Tools → Scripting*) den Skriptmenü-Ordner neu einlesen (*Rescan Script Menu Folder*, alternativ Vegas
+neu starten) und dort *Silenzium - Stimmen umwandeln* aufrufen.
+Der ElevenLabs-API-Key wird wie oben aus `.env` / `.env.local` gelesen.
+
+**Tastenkürzel Strg+Alt+V:** Die Installation trägt das Kürzel in `%APPDATA%\VEGAS Pro\<Version>\keyboard.ini`
+ein (Abschnitt `[TrackView]`, Eintrag `Script.Silenzium - Stimmen umwandeln=Ctrl+Alt+V`). Dabei gilt:
+
+- **Vegas muss geschlossen sein** – Vegas schreibt die Datei beim Beenden neu. Läuft Vegas, wird das Kürzel
+  übersprungen; nach dem Schließen `npm run vegas:install` erneut ausführen.
+- Ist für das Skript schon ein Kürzel eingetragen (auch ein selbst gewähltes), bleibt es unverändert.
+- Ist Strg+Alt+V bereits anders belegt, wird nichts überschrieben.
+- Vor einer Änderung wird `keyboard.ini.silenzium-backup` angelegt.
+
+Manuell geht es über *Optionen → Tastatur anpassen* (engl. *Options → Customize Keyboard*): im Filter „Silenzium“
+eingeben, *Script.Silenzium - Stimmen umwandeln* wählen, Kürzel drücken, *Hinzufügen*.
+
+**Dialog:**
+
+- **Spuren**: Häkchen = umwandeln, je Spur eine Voice (eigene und gespeicherte Voices). Vorausgewählt sind die in
+  Vegas markierten Spuren, sonst alle mit gespeicherter Voice. Spuren mit der Endung „_VC“ (oder dem früheren
+  „ (Voice)“) werden nicht angeboten.
+- Standardwerte im Vegas-Skript: Threshold fest −80 dBFS (Automatik aus), Pegel an Original „je Passage“.
+- **Einstellungen** für alle Spuren gemeinsam: Threshold (automatisch oder fest), Pre/Post, Min. Stille/Geräusch,
+  Blende, Mono → Stereo, Pegel, Modell, Ausgabeformat, Seed, Hintergrundgeräusche, Versatzausgleich.
+- **WAV-Rendervorlage**: vorausgewählt passend zur Projekt-Samplerate (Stereo, höchste Bittiefe).
+- Alle Einstellungen und die Voice je Spur werden gespeichert und beim nächsten Aufruf vorbelegt.
+
+Während der Verarbeitung zeigt ein Konsolenfenster den Fortschritt. Alle Dateien eines Durchgangs (gerenderte
+Originale, Ergebnisse, Silenzium-Projektdateien, Protokoll) liegen in `Silenzium\<Projektname>_<Zeitstempel>`
+neben der Vegas-Projektdatei (bei ungespeicherten Projekten unter `Dokumente\Silenzium`).
+
+## Kommandozeile
+
+Die komplette Verarbeitung ist auch ohne Browser verfügbar (wird vom Vegas-Skript verwendet):
+
+```bash
+npm run cli -- voices                                  # Voices (TSV: Gruppe, ID, Name, Kategorie)
+npm run cli -- models                                  # Voice-Changer-Modelle
+npm run cli -- process --input anna.wav --output anna_voice.wav --voice <id> [--settings einstellungen.ini] [--keep]
+npm run cli -- batch --jobs auftraege.tsv [--settings einstellungen.ini] [--results ergebnis.tsv]
+```
+
+- `--settings`: JSON oder `key=value`-Zeilen mit den Parametern aus `public/js/core/params.js`
+  (z. B. `preMs=100`, `elOutputFormat=pcm_24000`); einzelne Werte auch per `--set key=value`.
+- `batch`: je Zeile `Eingabe ⇥ Ausgabe ⇥ Voice-ID ⇥ Bezeichnung`; `--results` schreibt je Auftrag `ok`/`error`.
+- Neben jeder Ausgabe entsteht eine Silenzium-Projektdatei (`*.silenzium.json`) mit Timecodes und Parametern;
+  `--keep` speichert zusätzlich die reduzierte und die konvertierte Zwischendatei.
+- Eingaben: WAV oder MP3. Resampling und MP3-Dekodierung laufen ohne Browser (JS-Resampler, WASM-Decoder).
 
 ## Entwicklung
 
 ```bash
-npm test     # Unit-Tests der Kernlogik + Integrationstest des ElevenLabs-Proxys (simulierte API)
+npm test     # Unit-Tests der Kernlogik, Proxy- und CLI-Integrationstests (simulierte API)
 ```
 
 ```
-server.js              Statischer Server + API-Routen (ohne Abhängigkeiten)
+server.js              Statischer Server + API-Routen
 server/
-  elevenlabs.js        ElevenLabs-Proxy (Status, Voices, Models, Voice Changer)
+  elevenlabs.js        ElevenLabs-Aufrufe (Voices, Models, Voice Changer) + Proxy-Routen
   env.js, http.js      .env-Loader, HTTP-Helfer
 public/
   index.html, css/
@@ -172,11 +249,23 @@ public/
     chunks.js          Aufteilung in API-Anfragen, Längenanpassung
     pan.js             Panning erkennen und auf Mono-Ergebnisse übertragen
     level.js           Pegel des Originals messen und Ergebnisse angleichen
+    output.js          Ausgabe: Kanalzahl, Panning, Pegel (Web-App und CLI)
+    align.js           Versatz-Erkennung über die Pegelkurve
+    resample-sinc.js   Resampler in reinem JS (für Node)
   js/audio/            wav.js (WAV/PCM lesen/schreiben), mp3.js (Header), decode.js, resample.js, player.js
   js/api/              elevenlabs.js (Client des Proxys), voice-changer.js (Ablauf der Konvertierung)
   js/ui/               overview.js (Pegel-Übersicht), elevenlabs-panel.js, feedback.js
   js/util/             Formatierung, Hash, Speichern
-test/                  core.test.js, server.test.js
+cli/
+  silenzium.js         Kommandozeile (voices, models, process, batch)
+  pipeline.js          komplette Verarbeitung einer Datei
+  node-audio.js        Dekodieren (WAV, MP3 per WASM), Resampling, API-Aufruf in Node
+  settings.js          Einstellungs- und Auftragsdateien
+  install-vegas.js     Installation des Vegas-Skripts (inkl. Tastenkürzel)
+  vegas-keyboard.js    Kürzel in Vegas keyboard.ini eintragen
+vegas/
+  Silenzium - Stimmen umwandeln.cs   Vegas-Pro-Skript (C#, ab Version 14)
+test/                  core.test.js, server.test.js, cli.test.js, vegas-keyboard.test.js
 ```
 
 Grundsätze:

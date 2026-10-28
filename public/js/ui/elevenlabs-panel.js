@@ -116,6 +116,7 @@ export function initElevenLabsPanel({ store, getReducedChannels, saveWav, toOutp
         },
         maxChunkSec: params.elChunkSec,
         perChannel,
+        autoAlign: params.elAutoAlign,
         onProgress: (e) => logProgress(e, source.sampleRate),
         signal: controller.signal,
       });
@@ -171,7 +172,10 @@ export function initElevenLabsPanel({ store, getReducedChannels, saveWav, toOutp
       const diff = e.received - e.expected;
       const diffText = diff === 0 ? 'exakt' : `${diff > 0 ? '+' : ''}${((1000 * diff) / sampleRate).toFixed(1)} ms, angepasst`;
       const api = `API: ${e.apiChannels === 1 ? 'Mono' : `${e.apiChannels} Kanäle`}, ${e.apiSampleRate} Hz`;
-      currentEntry.textContent = `${label()}: ${t(e.expected)} gesendet, ${t(e.received)} erhalten (${diffText}; ${api}) ✓`;
+      const lag = e.lagSamples == null ? ''
+        : e.lagSamples === 0 ? '; kein Versatz'
+          : `; Versatz ${((1000 * e.lagSamples) / sampleRate).toFixed(1)} ms ausgeglichen`;
+      currentEntry.textContent = `${label()}: ${t(e.expected)} gesendet, ${t(e.received)} erhalten (${diffText}; ${api}${lag}) ✓`;
     }
   }
 
