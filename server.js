@@ -1,19 +1,29 @@
 /**
  * Lokaler Server für Silenzium – ohne Abhängigkeiten.
- * Liefert die Web-App aus public/ aus und bietet Platz für API-Routen
- * (geplant: ElevenLabs-Proxy, damit der API-Key nie im Browser landet).
+ * Liefert die Web-App aus public/ aus und stellt API-Routen bereit
+ * (ElevenLabs-Proxy, damit der API-Key nie im Browser landet).
  *
- *   node server.js [--open]      PORT / HOST über Umgebungsvariablen änderbar
+ *   node server.js [--open]      Konfiguration über .env bzw. Umgebungsvariablen (siehe .env.example)
  */
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { loadEnvFile } from './server/env.js';
+import { HttpError, sendJson } from './server/http.js';
+import { elevenLabsRoutes } from './server/elevenlabs.js';
 
-const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), 'public');
+const APP_DIR = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.join(APP_DIR, 'public');
+// .env.local (z. B. von der ElevenLabs-CLI angelegt) hat Vorrang vor .env
+const ENV_FILES = ['.env', '.env.local'].map((name) => path.join(APP_DIR, name));
+const loadEnv = () => ENV_FILES.forEach(loadEnvFile);
+
+loadEnv();
 const PORT = Number(process.env.PORT) || 5173;
 const HOST = process.env.HOST || '127.0.0.1';
+const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -27,15 +37,32 @@ const MIME = {
   '.mp3': 'audio/mpeg',
 };
 
-/** API-Routen: "METHODE /pfad" → handler(req, res, url) */
-const apiRoutes = {
-  'GET /api/health': (req, res) => sendJson(res, 200, { ok: true, app: 'silenzium' }),
-  // Ausbaustufe: 'GET /api/elevenlabs/voices', 'POST /api/elevenlabs/speech-to-speech/:voiceId'
-};
+/** API-Routen: { method, pattern, handler(req, res, url, captures) } */
+const apiRoutes = [
+  { method: 'GET', pattern: /^\/api\/health$/, handler: (req, res) => sendJson(res, 200, { ok: true, app: 'silenzium' }) },
+  ...elevenLabsRoutes,
+];
 
-function sendJson(res, status, body) {
-  res.writeHead(status, { 'Content-Type': MIME['.json'], 'Cache-Control': 'no-store' });
-  res.end(JSON.stringify(body));
+/**
+ * Nur Anfragen der eigenen Seite zulassen: verhindert, dass fremde Webseiten (CSRF, DNS-Rebinding)
+ * über den lokalen Server die ElevenLabs-API mit deinem Key aufrufen.
+ */
+function isTrustedApiRequest(req) {
+  const host = req.headers.host ?? '';
+  const origin = req.headers.origin;
+  if (origin && origin !== `http://${host}`) return false;
+  const loopbackOnly = HOST === '127.0.0.1' || HOST === 'localhost' || HOST === '::1';
+  return !loopbackOnly || LOOPBACK_HOST.test(host);
+}
+
+async function handleApi(req, res, url) {
+  if (!isTrustedApiRequest(req)) throw new HttpError(403, 'Anfrage von fremder Herkunft abgelehnt.');
+  loadEnv(); // Key kann ohne Neustart nachgetragen werden
+  for (const route of apiRoutes) {
+    const match = route.pattern.exec(url.pathname);
+    if (match && route.method === req.method) return route.handler(req, res, url, match.slice(1));
+  }
+  throw new HttpError(404, 'Unbekannte API-Route');
 }
 
 function serveStatic(req, res, url) {
@@ -71,9 +98,7 @@ const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
   try {
     if (url.pathname.startsWith('/api/')) {
-      const handler = apiRoutes[`${req.method} ${url.pathname}`];
-      if (handler) await handler(req, res, url);
-      else sendJson(res, 404, { error: 'Unbekannte API-Route' });
+      await handleApi(req, res, url);
       return;
     }
     if (req.method !== 'GET' && req.method !== 'HEAD') {
@@ -82,8 +107,9 @@ const server = http.createServer(async (req, res) => {
     }
     serveStatic(req, res, url);
   } catch (err) {
-    console.error(err);
-    if (!res.headersSent) sendJson(res, 500, { error: err.message });
+    if (err.name === 'AbortError') return; // Browser hat abgebrochen
+    if (!(err instanceof HttpError)) console.error(err);
+    if (!res.headersSent) sendJson(res, err.status ?? 500, { error: err.message });
     else res.end();
   }
 });
@@ -91,6 +117,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, HOST, () => {
   const address = `http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}/`;
   console.log(`Silenzium läuft auf ${address}  (Beenden mit Strg+C)`);
+  console.log(`ElevenLabs: ${process.env.ELEVENLABS_API_KEY?.trim() ? 'API-Key gefunden' : 'nicht konfiguriert (optional, siehe .env.example)'}`);
   if (process.argv.includes('--open')) openBrowser(address);
 });
 

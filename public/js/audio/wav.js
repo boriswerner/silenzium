@@ -152,6 +152,24 @@ export function encodeWav(channels, sampleRate, sampleFormat = 'pcm16') {
   return buffer;
 }
 
+/** Ein Kanal → rohes 16-Bit-PCM little-endian ohne Header (z. B. ElevenLabs pcm_s16le_16). */
+export function encodePcmS16le(samples) {
+  const buffer = new ArrayBuffer(samples.length * 2);
+  const v = new DataView(buffer);
+  for (let i = 0; i < samples.length; i++) {
+    v.setInt16(i * 2, Math.max(-32768, Math.min(32767, Math.round(samples[i] * 32768))), true);
+  }
+  return buffer;
+}
+
+/** Rohes 16-Bit-PCM little-endian (Mono) → Float32Array. */
+export function decodePcmS16le(buffer) {
+  const v = new DataView(buffer);
+  const out = new Float32Array(Math.floor(buffer.byteLength / 2));
+  for (let i = 0; i < out.length; i++) out[i] = v.getInt16(i * 2, true) / 32768;
+  return out;
+}
+
 /** 'auto' → Format der Quelle (falls WAV), sonst 16 Bit. */
 export function resolveSampleFormat(exportFormat, sourceFormat) {
   if (exportFormat && exportFormat !== 'auto') return exportFormat;

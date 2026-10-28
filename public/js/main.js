@@ -1,14 +1,18 @@
 import { DEFAULT_PARAMS, DETECTION_KEYS, msToSamples } from './core/params.js';
-import { computeEnvelope, detectSegments, estimateNoiseFloor } from './core/detect.js';
+import { computeEnvelope, detectSegments, suggestThreshold } from './core/detect.js';
 import { layoutSegments, renderReduced, renderRestored } from './core/segments.js';
 import { buildProject, parseProject } from './core/project.js';
+import { analyzePan, upmixPanned, describePan } from './core/pan.js';
+import { analyzeLevel, matchLevel, globalGain, toDb } from './core/level.js';
 import { decodeAudio } from './audio/decode.js';
 import { encodeWav, resolveSampleFormat, SAMPLE_FORMATS } from './audio/wav.js';
-import { resample } from './audio/resample.js';
+import { resample, matchChannels } from './audio/resample.js';
 import * as player from './audio/player.js';
 import { sha256Hex, bytesToDataUrl, dataUrlToBytes, guessMimeType, saveFile } from './util/files.js';
 import { formatTime, formatBytes, baseName } from './util/format.js';
 import { drawOverview } from './ui/overview.js';
+import { withBusy, toast, guarded } from './ui/feedback.js';
+import { initElevenLabsPanel } from './ui/elevenlabs-panel.js';
 import { Store } from './state.js';
 
 const $ = (sel) => document.querySelector(sel);
@@ -20,7 +24,8 @@ const $$ = (sel) => [...document.querySelectorAll(sel)];
  * sourceBytes  – Originalbytes der Eingabedatei (für Einbettung) oder null
  * envelope     – RMS-Hüllkurve für Analyse und Übersicht
  * layout       – { segments, silences, reducedLength }
- * processed    – bearbeitete Datei, bereits in Original-Samplerate
+ * processed    – bearbeitete Datei, bereits in Original-Samplerate (manuell geöffnet oder von ElevenLabs)
+ * converted    – Ergebnis des ElevenLabs Voice Changers (zum separaten Export)
  */
 function initialState() {
   return {
@@ -31,6 +36,7 @@ function initialState() {
     envelope: null,
     layout: null,
     processed: null,
+    converted: null,
   };
 }
 
@@ -62,14 +68,25 @@ async function openInputFile(file) {
     // Projekt ohne eingebettete Datei geladen → passende Originaldatei nachträglich zuordnen
     if (st.source && !st.sourceAudio) {
       if (st.source.sha256 === sha256 || (st.source.length === source.length && st.source.sampleRate === source.sampleRate)) {
-        store.update({ source, sourceAudio, sourceBytes: bytes, envelope: makeEnvelope(sourceAudio, st.params) });
+        store.update({
+          source, sourceAudio, sourceBytes: bytes,
+          envelope: makeEnvelope(sourceAudio, st.params),
+          // ältere Projekte ohne Panning-/Pegel-Angaben ergänzen
+          ...(!('rmsGlobal' in st.layout) && { layout: analyzeOriginal(sourceAudio.channels, st.layout) }),
+        });
         toast('Originaldatei dem Projekt zugeordnet.');
         return;
       }
       toast('Die Datei passt nicht zum geladenen Projekt – es wird ein neues Projekt begonnen.', 'warn');
     }
 
-    store.update({ ...initialState(), params: st.params, source, sourceAudio, sourceBytes: bytes });
+    let params = st.params;
+    let envelope = null;
+    if (params.autoThreshold) {
+      envelope = makeEnvelope(sourceAudio, params);
+      params = { ...params, thresholdDb: thresholdFromNoise(envelope) };
+    }
+    store.update({ ...initialState(), params, source, sourceAudio, sourceBytes: bytes, envelope });
     analyze();
   });
 }
@@ -78,13 +95,23 @@ function makeEnvelope(audio, params) {
   return computeEnvelope(audio.channels, audio.sampleRate, params.windowMs);
 }
 
+/** Schätzt das Grundrauschen und liefert einen Threshold knapp darüber. */
+function thresholdFromNoise(envelope) {
+  const { thresholdDb, floorDb, digitalShare, capped } = suggestThreshold(envelope);
+  $('#noise-hint').textContent = capped
+    ? `Pausen überwiegend digitale Stille (${Math.round(digitalShare * 100)} %) → Threshold auf ${thresholdDb} dB begrenzt `
+      + `(Schätzung aus den übrigen leisen Stellen: ${floorDb.toFixed(1)} dBFS).`
+    : `Geschätztes Grundrauschen: ${floorDb.toFixed(1)} dBFS → Threshold ${thresholdDb} dB (Rauschen + 8 dB).`;
+  return thresholdDb;
+}
+
 function analyze() {
   const { sourceAudio, source, params } = store.state;
   if (!sourceAudio) return;
   let envelope = store.state.envelope;
   if (!envelope || envelope.windowMs !== params.windowMs) envelope = makeEnvelope(sourceAudio, params);
   const runs = detectSegments(envelope, source.length, source.sampleRate, params);
-  store.update({ envelope, layout: layoutSegments(runs, source.length) });
+  store.update({ envelope, layout: analyzeOriginal(sourceAudio.channels, layoutSegments(runs, source.length)) });
 }
 
 let analyzeTimer = 0;
@@ -121,7 +148,10 @@ async function openProjectFile(file) {
       sourceBytes,
       envelope,
       params: project.params,
-      layout: project.layout,
+      // ältere Projekte ohne Panning-/Pegel-Angaben ergänzen, sofern das Audio eingebettet ist
+      layout: sourceAudio && !('rmsGlobal' in project.layout)
+        ? analyzeOriginal(sourceAudio.channels, project.layout)
+        : project.layout,
     });
     toast(sourceAudio
       ? `Projekt „${file.name}“ geladen.`
@@ -155,17 +185,77 @@ function reducedChannels() {
   return renderReduced(sourceAudio.channels, layout, sourceAudio.sampleRate, params.fadeMs);
 }
 
-async function exportReduced() {
+/** Kanalzahl aller Exporte: wie die Eingabe, oder 1 bei „Mono-Ausgabe“. */
+function outputChannelCount() {
+  const { params, source } = store.state;
+  return params.monoOutput ? 1 : source.channelCount;
+}
+
+const formatDb = (rms) => (rms ? `${toDb(rms).toFixed(1).replace('-', '−')} dBFS` : '–');
+
+function channelLabel(count) {
+  return count === 1 ? 'Mono' : count === 2 ? 'Stereo' : `${count} Kanäle`;
+}
+
+/** Mono-Ergebnis → Stereo-Ausgabe mit dem erkannten Panning des Originals? */
+function usesPan(channels) {
+  const { layout, params } = store.state;
+  return channels.length === 1 && outputChannelCount() === 2 && params.panMode !== 'off' && !!layout?.panGlobal;
+}
+
+/**
+ * Bringt Kanäle auf die Ausgabe-Kanalzahl. Ein Mono-Signal wird dabei – falls erkannt – mit dem
+ * Panning des Originals verteilt, sonst gleich auf alle Kanäle.
+ * @param {'dst'|'src'} timeline Zeitachse der Kanäle: reduzierte Datei oder Original
+ */
+function toOutput(channels, timeline = 'dst') {
+  const { layout, params } = store.state;
+  if (usesPan(channels)) return upmixPanned(channels[0], layout, { mode: params.panMode, timeline });
+  return matchChannels(channels, outputChannelCount());
+}
+
+/** Wie toOutput, für bearbeitete Ergebnisse zusätzlich mit Pegelabgleich an das Original. */
+function processedOutput(channels, timeline = 'dst') {
+  const { layout, params } = store.state;
+  return matchLevel(toOutput(channels, timeline), layout, { mode: params.levelMode, timeline });
+}
+
+/** Ermittelt Panning und Pegel des Originals (für die Nachbildung in bearbeiteten Ergebnissen). */
+function analyzeOriginal(channels, layout) {
+  return analyzeLevel(channels, analyzePan(channels, layout));
+}
+
+/**
+ * Speichert Kanäle als WAV im gewählten Exportformat und mit der Ausgabe-Kanalzahl.
+ * channels darf eine Funktion sein, damit erst nach dem Speichern-Dialog gerechnet wird.
+ */
+async function saveWav({ suggestedName, channels, sampleRate, busyText }) {
   const { source, params } = store.state;
   const format = resolveSampleFormat(params.exportFormat, source.sampleFormat);
+  const channelCount = outputChannelCount();
+  let length = 0;
   const saved = await saveFile({
-    suggestedName: `${baseName(source.name)}_reduced.wav`,
+    suggestedName,
     mimeType: 'audio/wav',
     extension: '.wav',
     description: 'WAV-Audio',
-  }, () => withBusy('Erzeuge reduzierte WAV …', async () =>
-    new Blob([encodeWav(reducedChannels(), source.sampleRate, format)], { type: 'audio/wav' })));
-  if (saved) toast(`Reduzierte WAV exportiert (${SAMPLE_FORMATS[format].label}).`);
+  }, () => withBusy(busyText, async () => {
+    const data = toOutput(typeof channels === 'function' ? channels() : channels);
+    length = data[0]?.length ?? 0;
+    return new Blob([encodeWav(data, sampleRate, format)], { type: 'audio/wav' });
+  }));
+  if (saved) toast(`${suggestedName} exportiert (${SAMPLE_FORMATS[format].label}, ${channelLabel(channelCount)}).`);
+  return saved ? { length, channelCount } : null;
+}
+
+async function exportReduced() {
+  const { source } = store.state;
+  await saveWav({
+    suggestedName: `${baseName(source.name)}_reduced.wav`,
+    channels: reducedChannels,
+    sampleRate: source.sampleRate,
+    busyText: 'Erzeuge reduzierte WAV …',
+  });
 }
 
 // ---------------------------------------------------------------- Wiederherstellung
@@ -193,34 +283,32 @@ async function openProcessedFile(file) {
 
 function restoredChannels() {
   const { processed, layout, source, params } = store.state;
-  return renderRestored(processed.channels, layout, source.length, source.sampleRate, {
+  const restored = renderRestored(processed.channels, layout, source.length, source.sampleRate, {
     fadeMs: params.fadeMs,
     mode: params.restoreMode,
     offsetSamples: msToSamples(params.restoreOffsetMs, source.sampleRate),
   });
+  // Panning und Pegel erst nach dem Zurücksetzen auf die Original-Positionen anwenden, damit
+  // Versatz und proportionale Zuordnung die Passagengrenzen nicht verschieben
+  return processedOutput(restored, 'src');
 }
 
 async function exportRestored() {
-  const { processed, source, params } = store.state;
-  const format = resolveSampleFormat(params.exportFormat, source.sampleFormat);
-  let length = 0;
-  const saved = await saveFile({
+  const { processed, source } = store.state;
+  const saved = await saveWav({
     suggestedName: `${baseName(processed.name)}_restored.wav`,
-    mimeType: 'audio/wav',
-    extension: '.wav',
-    description: 'WAV-Audio',
-  }, () => withBusy('Erzeuge wiederhergestellte WAV …', async () => {
-    const channels = restoredChannels();
-    length = channels[0].length;
-    return new Blob([encodeWav(channels, source.sampleRate, format)], { type: 'audio/wav' });
-  }));
+    channels: restoredChannels,
+    sampleRate: source.sampleRate,
+    busyText: 'Erzeuge wiederhergestellte WAV …',
+  });
   if (!saved) return;
 
+  const { length, channelCount } = saved;
   const el = $('#restore-result');
   el.hidden = false;
   el.classList.toggle('ok', length === source.length);
   el.textContent = length === source.length
-    ? `✓ Exportiert: ${length.toLocaleString('de-DE')} Samples @ ${source.sampleRate} Hz = exakt die Länge des Originals (${formatTime(length / source.sampleRate)}).`
+    ? `✓ Exportiert: ${length.toLocaleString('de-DE')} Samples @ ${source.sampleRate} Hz, ${channelLabel(channelCount)} = exakt die Länge des Originals (${formatTime(length / source.sampleRate)}).`
     : `Achtung: Länge ${length} ≠ Original ${source.length}.`;
 }
 
@@ -234,12 +322,12 @@ function renderInputInfo({ source, sourceAudio }) {
     notice.hidden = true;
     return;
   }
-  const containerLabel = { wav: 'WAV', mp3: 'MP3', other: 'Audio' }[source.container] ?? '–';
+  const containerLabel = CONTAINER_LABELS[source.container] ?? '–';
   info.replaceChildren(...infoItems([
     ['Datei', source.name],
     ['Format', `${containerLabel}${source.sampleFormat ? ` · ${SAMPLE_FORMATS[source.sampleFormat].label}` : ''}`],
     ['Samplerate', `${source.sampleRate} Hz`],
-    ['Kanäle', source.channelCount],
+    ['Kanäle', channelLabel(source.channelCount)],
     ['Dauer', formatTime(source.length / source.sampleRate)],
     ['Samples', source.length.toLocaleString('de-DE')],
     ['Größe', formatBytes(source.size)],
@@ -251,8 +339,9 @@ function renderInputInfo({ source, sourceAudio }) {
 
 function renderParams({ params }) {
   for (const el of $$('[data-param]')) {
-    if (document.activeElement === el && el.type === 'number') continue;
-    el.value = params[el.dataset.param];
+    const value = params[el.dataset.param];
+    if (el.type === 'checkbox') el.checked = !!value;
+    else if (document.activeElement !== el || el.type !== 'number') el.value = value ?? '';
   }
 }
 
@@ -280,10 +369,13 @@ function renderStats({ source, layout }) {
     <div><span>Stillen</span> <b>${layout.silences.length}</b></div>
     <div><span>Original</span> <b>${formatTime(source.length / sr)}</b></div>
     <div><span>Reduziert</span> <b>${formatTime(layout.reducedLength / sr)}</b> <span>(${pct.toFixed(1)} %)</span></div>
-    <div><span>Entfernt</span> <b>${formatTime((source.length - layout.reducedLength) / sr)}</b></div>`;
+    <div><span>Entfernt</span> <b>${formatTime((source.length - layout.reducedLength) / sr)}</b></div>
+    ${layout.rmsGlobal ? `<div><span>Pegel</span> <b>${formatDb(layout.rmsGlobal)}</b> <span>RMS</span></div>` : ''}
+    ${layout.panGlobal ? `<div><span>Panning</span> <b>${describePan(layout.panGlobal)}</b></div>` : ''}`;
 }
 
 const MAX_TABLE_ROWS = 2000;
+const CONTAINER_LABELS = { wav: 'WAV', mp3: 'MP3', other: 'Audio', elevenlabs: 'ElevenLabs Voice Changer' };
 
 function renderTable({ source, layout }) {
   const table = $('#segment-table');
@@ -292,18 +384,21 @@ function renderTable({ source, layout }) {
     return;
   }
   const t = (n) => formatTime(n / source.sampleRate);
+  const stereo = !!layout.panGlobal;
+  const level = layout.rmsGlobal != null;
   const rows = [
     ...layout.segments.map((s, i) => ({ start: s.srcStart, html:
-      `<td>Passage ${i + 1}</td><td>${t(s.srcStart)}</td><td>${t(s.srcEnd)}</td><td>${t(s.srcEnd - s.srcStart)}</td><td>${t(s.dstStart)}</td><td>${t(s.dstEnd)}</td>` })),
+      `<td>Passage ${i + 1}</td><td>${t(s.srcStart)}</td><td>${t(s.srcEnd)}</td><td>${t(s.srcEnd - s.srcStart)}</td><td>${t(s.dstStart)}</td><td>${t(s.dstEnd)}</td>`
+      + (level ? `<td>${formatDb(s.rms)}</td>` : '') + (stereo ? `<td>${describePan(s.pan)}</td>` : '') })),
     ...layout.silences.map((s) => ({ start: s.start, silence: true, html:
-      `<td>Stille</td><td>${t(s.start)}</td><td>${t(s.end)}</td><td>${t(s.end - s.start)}</td><td>–</td><td>–</td>` })),
+      `<td>Stille</td><td>${t(s.start)}</td><td>${t(s.end)}</td><td>${t(s.end - s.start)}</td><td>–</td><td>–</td>${level ? '<td></td>' : ''}${stereo ? '<td></td>' : ''}` })),
   ].sort((a, b) => a.start - b.start);
 
   const shown = rows.slice(0, MAX_TABLE_ROWS);
-  table.innerHTML = `<thead><tr><th></th><th>Start (Original)</th><th>Ende (Original)</th><th>Dauer</th><th>Start (reduziert)</th><th>Ende (reduziert)</th></tr></thead>
+  table.innerHTML = `<thead><tr><th></th><th>Start (Original)</th><th>Ende (Original)</th><th>Dauer</th><th>Start (reduziert)</th><th>Ende (reduziert)</th>${level ? '<th>Pegel (RMS)</th>' : ''}${stereo ? '<th>Panning</th>' : ''}</tr></thead>
     <tbody>${shown.map((r) => `<tr${r.silence ? ' class="silence"' : ''}>${r.html}</tr>`).join('')}</tbody>`;
   if (rows.length > shown.length) {
-    table.insertAdjacentHTML('beforeend', `<tfoot><tr><td colspan="6">… ${rows.length - shown.length} weitere Zeilen (vollständig in der Projektdatei)</td></tr></tfoot>`);
+    table.insertAdjacentHTML('beforeend', `<tfoot><tr><td colspan="8">… ${rows.length - shown.length} weitere Zeilen (vollständig in der Projektdatei)</td></tr></tfoot>`);
   }
   $('#timecodes summary').textContent = `Timecodes (${layout.segments.length} Passagen, ${layout.silences.length} Stillen)`;
 }
@@ -323,13 +418,25 @@ function renderProcessedInfo({ processed, layout, source, params }) {
 
   info.replaceChildren(...infoItems([
     ['Datei', processed.name],
+    ['Quelle', CONTAINER_LABELS[processed.container] ?? '–'],
     ['Samplerate', `${processed.sampleRate} Hz${resampled}`],
-    ['Kanäle', processed.channels.length],
+    ['Kanäle', `${channelLabel(processed.channels.length)} → Ausgabe ${channelLabel(outputChannelCount())}`
+      + (usesPan(processed.channels) ? ` (Panning ${params.panMode === 'segment' ? 'je Passage' : describePan(layout.panGlobal)})` : '')],
+    ['Pegelanpassung', describeLevelMatch(processed, layout, params)],
     ['Erwartete Länge', `${formatTime(layout.reducedLength / sr)} (${layout.reducedLength.toLocaleString('de-DE')})`],
     ['Tatsächliche Länge', `${formatTime(processed.length / sr)} (${processed.length.toLocaleString('de-DE')})`],
     ['Abweichung', diff === 0 ? 'keine' : `${diff > 0 ? '+' : ''}${diffMs.toFixed(1)} ms (${diff > 0 ? '+' : ''}${diff} Samples)`, diffClass],
     ['Ergebnislänge', `${formatTime(source.length / sr)} (${source.length.toLocaleString('de-DE')})`, 'ok'],
   ]));
+}
+
+/** Text für die Pegelanpassung in Schritt 3, z. B. „+14.2 dB (ganze Datei)“. */
+function describeLevelMatch(processed, layout, params) {
+  if (params.levelMode === 'off' || layout.rmsGlobal == null) return 'aus';
+  if (params.levelMode === 'segment') return 'je Passage';
+  const { gain, limited } = globalGain(toOutput(processed.channels), layout);
+  const db = toDb(gain);
+  return `${db >= 0 ? '+' : '−'}${Math.abs(db).toFixed(1)} dB (ganze Datei)${limited ? ', begrenzt gegen Übersteuerung' : ''}`;
 }
 
 function infoItems(items) {
@@ -356,6 +463,8 @@ function renderButtons({ source, sourceAudio, layout, processed, envelope }) {
   $('#btn-play-restored').disabled = !(layout && processed);
   $('#btn-export-restored').disabled = !(layout && processed);
   $('#opt-embed').disabled = !source;
+  $('[data-param="panMode"]').disabled = !layout?.panGlobal || store.state.params.monoOutput;
+  $('[data-param="levelMode"]').disabled = layout?.rmsGlobal == null;
 }
 
 store.on(['source', 'sourceAudio'], renderInputInfo);
@@ -364,7 +473,7 @@ store.on(['source', 'envelope', 'layout', 'params'], renderOverview);
 store.on(['layout'], renderStats);
 store.on(['layout'], renderTable);
 store.on(['processed', 'layout', 'params'], renderProcessedInfo);
-store.on(['source', 'sourceAudio', 'layout', 'processed', 'envelope'], renderButtons);
+store.on(['source', 'sourceAudio', 'layout', 'processed', 'envelope', 'params'], renderButtons);
 
 function renderAll() {
   const st = store.state;
@@ -378,37 +487,6 @@ function renderAll() {
 }
 
 // ---------------------------------------------------------------- UI-Helfer
-
-let busyDepth = 0;
-async function withBusy(text, fn) {
-  busyDepth++;
-  $('#busy-text').textContent = text;
-  $('#busy').hidden = false;
-  await new Promise((r) => setTimeout(r, 30)); // Overlay zeichnen lassen, bevor synchron gerechnet wird
-  try {
-    return await fn();
-  } finally {
-    if (--busyDepth === 0) $('#busy').hidden = true;
-  }
-}
-
-function toast(message, level = 'info') {
-  const el = document.createElement('div');
-  el.className = `toast ${level}`;
-  el.textContent = message;
-  $('#toasts').append(el);
-  setTimeout(() => el.remove(), level === 'error' ? 9000 : 5000);
-}
-
-/** Fängt Fehler von UI-Aktionen ab und zeigt sie an. */
-const guarded = (fn) => async (...args) => {
-  try {
-    await fn(...args);
-  } catch (err) {
-    console.error(err);
-    toast(err?.message || String(err), 'error');
-  }
-};
 
 function setupDropzone(zone, input, onFile) {
   zone.querySelector('[data-pick]').addEventListener('click', () => input.click());
@@ -437,9 +515,12 @@ function bindParams() {
       const key = el.dataset.param;
       const raw = el.value;
       let value = raw;
-      if (el.type === 'number' || el.type === 'range') {
-        if (raw === '' || !Number.isFinite(Number(raw))) return;
-        value = Number(raw);
+      if (el.type === 'checkbox') {
+        value = el.checked;
+      } else if (el.type === 'number' || el.type === 'range') {
+        if (raw === '' && 'optional' in el.dataset) value = null;
+        else if (raw === '' || !Number.isFinite(Number(raw))) return;
+        else value = Number(raw);
       }
       if (el.dataset.sync) {
         for (const peer of $$(`[data-sync="${el.dataset.sync}"]`)) if (peer !== el) peer.value = raw;
@@ -472,10 +553,7 @@ function init() {
   $('#btn-save-project').addEventListener('click', guarded(saveProject));
 
   $('#btn-estimate').addEventListener('click', () => {
-    const floor = estimateNoiseFloor(store.state.envelope);
-    const threshold = Math.min(-10, Math.max(-90, Math.round((floor + 8) * 2) / 2));
-    $('#noise-hint').textContent = `Geschätztes Grundrauschen: ${floor.toFixed(1)} dBFS → Threshold ${threshold} dB (Rauschen + 8 dB).`;
-    store.update({ params: { ...store.state.params, thresholdDb: threshold } });
+    store.update({ params: { ...store.state.params, thresholdDb: thresholdFromNoise(store.state.envelope) } });
     analyze();
   });
 
@@ -489,6 +567,8 @@ function init() {
 
   $('#btn-export-reduced').addEventListener('click', guarded(exportReduced));
   $('#btn-export-restored').addEventListener('click', guarded(exportRestored));
+
+  initElevenLabsPanel({ store, getReducedChannels: reducedChannels, saveWav, toOutput: processedOutput });
 
   window.addEventListener('resize', () => requestAnimationFrame(renderOverview));
   matchMedia('(prefers-color-scheme: dark)').addEventListener('change', renderOverview);

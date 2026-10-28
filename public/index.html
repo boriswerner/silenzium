@@ -49,6 +49,7 @@
             <input type="range" min="-90" max="0" step="0.5" data-param="thresholdDb" data-sync="threshold">
             <input type="number" min="-120" max="0" step="0.5" data-param="thresholdDb" data-sync="threshold">
             <button type="button" id="btn-estimate" title="Schätzt das Grundrauschen und setzt den Threshold knapp darüber">Grundrauschen schätzen</button>
+            <label class="check"><input type="checkbox" data-param="autoThreshold"> beim Laden automatisch</label>
           </div>
           <small class="hint" id="noise-hint">Alles unterhalb dieses Pegels gilt als Stille – inkl. Grundrauschen.</small>
         </label>
@@ -71,6 +72,8 @@
             <option value="pcm24">24 Bit PCM</option>
             <option value="float32">32 Bit Float</option>
           </select></label>
+        <label class="param check-param" title="Alle Exporte (reduziert, konvertiert, wiederhergestellt) als Mono statt mit der Kanalzahl der Eingabe">
+          <input type="checkbox" data-param="monoOutput"> Mono-Ausgabe</label>
       </div>
 
       <div class="overview-wrap">
@@ -99,6 +102,55 @@
       </div>
     </section>
 
+    <!-- Optional · ElevenLabs -->
+    <section class="card" id="sec-elevenlabs">
+      <h2><span class="step">⇄</span> ElevenLabs Voice Changer <span class="badge">optional</span></h2>
+      <p class="hint">Sendet die reduzierte Datei (16 kHz Mono, pcm_s16le_16) an die ElevenLabs Voice-Changer-API.
+        Das Ergebnis wird automatisch als bearbeitete Datei in Schritt 3 übernommen. Alternativ funktioniert weiterhin
+        der manuelle Weg: reduzierte WAV exportieren, extern bearbeiten und in Schritt 3 öffnen.
+        Die API verarbeitet nur Mono: Bei Stereo-Eingaben wird das Ergebnis mit dem erkannten Panning des Originals
+        auf beide Kanäle verteilt – oder die Kanäle werden einzeln konvertiert (doppelte Credits).</p>
+      <p class="notice" id="el-status"></p>
+
+      <div id="el-controls">
+        <div class="params">
+          <label class="param span2"><span>Voice</span>
+            <select id="el-voice" data-param="elVoiceId"></select></label>
+          <label class="param"><span>Modell</span>
+            <select id="el-model" data-param="elModelId"></select></label>
+          <label class="param span2"><span>Ausgabeformat der API</span>
+            <select id="el-format" data-param="elOutputFormat"></select></label>
+          <label class="param"><span>Max. Länge je Anfrage <small>(s)</small></span>
+            <input type="number" min="10" max="300" step="10" data-param="elChunkSec"
+              title="ElevenLabs verarbeitet max. 5 Minuten pro Anfrage; längere Dateien werden an Passagengrenzen aufgeteilt"></label>
+          <label class="param"><span>Seed <small>(optional)</small></span>
+            <input type="number" min="0" max="4294967295" step="1" data-param="elSeed" data-optional placeholder="zufällig"></label>
+          <label class="param check-param"><input type="checkbox" data-param="elRemoveNoise"> Hintergrundgeräusche entfernen</label>
+          <label class="param check-param span2"
+            title="Jeder Kanal wird separat an die API gesendet (Credits × Kanalzahl). Alle Kanäle nutzen denselben Seed.">
+            <input type="checkbox" id="el-per-channel" data-param="elPerChannel"> Kanäle einzeln konvertieren
+            <small class="hint" id="el-per-channel-hint"></small></label>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <button type="button" id="el-reload">Erneut prüfen</button>
+        <button type="button" id="el-preview">▶ Voice-Vorschau</button>
+        <button type="button" id="el-convert" class="primary">Reduzierte Datei konvertieren</button>
+        <button type="button" id="el-cancel" hidden>Abbrechen</button>
+        <span class="hint" id="el-scope"></span>
+      </div>
+      <ol class="log" id="el-log"></ol>
+      <p class="notice" id="el-stale" hidden>Die Analyse wurde seit der Konvertierung geändert – das Ergebnis passt nicht mehr zu den aktuellen Schnitten.</p>
+
+      <div class="toolbar">
+        <button type="button" id="el-play">▶ Konvertiert</button>
+        <button type="button" class="stop">■ Stopp</button>
+        <span class="spacer"></span>
+        <button type="button" id="el-export" class="primary">Konvertierte WAV exportieren</button>
+      </div>
+    </section>
+
     <!-- 3 · Wiederherstellung -->
     <section class="card" id="sec-restore">
       <h2><span class="step">3</span> Stille wieder einfügen</h2>
@@ -116,6 +168,20 @@
             title="exakt: Segmente an den gespeicherten Sample-Positionen · proportional: Längenabweichung gleichmäßig über alle Schnitte verteilen">
             <option value="exact">exakt</option>
             <option value="stretch">proportional</option>
+          </select></label>
+        <label class="param span2"><span>Mono → Stereo</span>
+          <select data-param="panMode"
+            title="Wie ein Mono-Ergebnis auf eine Stereo-Ausgabe verteilt wird. Das Panning wird aus dem Original erkannt (ein Sprecher).">
+            <option value="global">Panning des Originals</option>
+            <option value="segment">Panning des Originals je Passage</option>
+            <option value="off">gleich auf beide Kanäle</option>
+          </select></label>
+        <label class="param"><span>Pegel an Original anpassen</span>
+          <select data-param="levelMode"
+            title="Bringt das bearbeitete Ergebnis auf den RMS-Pegel des Originals (begrenzt gegen Übersteuerung)">
+            <option value="global">ganze Datei</option>
+            <option value="segment">je Passage</option>
+            <option value="off">aus</option>
           </select></label>
         <label class="param"><span>Versatz <small>(ms)</small></span>
           <input type="number" step="1" data-param="restoreOffsetMs"

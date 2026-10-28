@@ -4,6 +4,8 @@
  */
 import { DEFAULT_PARAMS } from './params.js';
 import { layoutSegments, sanitizeRuns } from './segments.js';
+import { withPans } from './pan.js';
+import { withLevels } from './level.js';
 import { formatTime } from '../util/format.js';
 
 export const PROJECT_FORMAT = 'silenzium-project';
@@ -41,8 +43,12 @@ export function buildProject({ source, params, layout, embeddedSource = null }) 
       length: layout.reducedLength,
       duration: layout.reducedLength / sr,
     },
+    // Panning des Originals als Verstärkungen [links, rechts]; je Passage zusätzlich in segments[].pan
+    ...('panGlobal' in layout && { panGlobal: layout.panGlobal }),
+    // RMS-Pegel des Originals (linear) über alle Passagen; je Passage zusätzlich in segments[].rms
+    ...('rmsGlobal' in layout && { rmsGlobal: layout.rmsGlobal }),
     segments: layout.segments.map((s) => ({
-      ...s,
+      ...s, // inkl. pan [links, rechts] bei Stereo und rms (Pegel des Originals)
       srcStartTime: t(s.srcStart), srcEndTime: t(s.srcEnd),
       dstStartTime: t(s.dstStart), dstEndTime: t(s.dstEnd),
     })),
@@ -85,10 +91,13 @@ export function parseProject(text) {
   };
 
   const runs = sanitizeRuns((data.segments ?? []).map((seg) => [seg.srcStart, seg.srcEnd]), source.length);
+  let layout = layoutSegments(runs, source.length);
+  if (data.panGlobal !== undefined) layout = withPans(layout, data.segments ?? [], data.panGlobal);
+  if (data.rmsGlobal !== undefined) layout = withLevels(layout, data.segments ?? [], data.rmsGlobal);
   return {
     source,
     params: { ...DEFAULT_PARAMS, ...data.params },
-    layout: layoutSegments(runs, source.length),
+    layout,
     embeddedSource: typeof data.embeddedSource === 'string' ? data.embeddedSource : null,
   };
 }

@@ -20,6 +20,16 @@ export async function resample(channels, fromRate, toRate) {
   return Array.from({ length: rendered.numberOfChannels }, (_, c) => rendered.getChannelData(c));
 }
 
+/**
+ * Bringt Kanäle auf die gewünschte Anzahl: gleich → unverändert, sonst Mono-Mix,
+ * der auf alle Zielkanäle gelegt wird (z. B. Mono-Ergebnis → Stereo-Datei).
+ */
+export function matchChannels(channels, count) {
+  if (channels.length === count) return channels;
+  const [mono] = mixToMono(channels);
+  return Array.from({ length: count }, () => mono);
+}
+
 /** Mischt alle Kanäle zu Mono (Mittelwert). */
 export function mixToMono(channels) {
   if (channels.length === 1) return channels;
